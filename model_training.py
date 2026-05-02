@@ -1,11 +1,16 @@
 import os
 import numpy as np
+import pandas as pd
 from data_preprocessor import preprocess_and_split
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras.optimizers import Adam, RMSprop, Nadam
 
 data_dir = "data_storage"
+os.makedirs("models", exist_ok=True)
+output_path = "models/experiment_results.csv"
 default_file = "GSPC_clean_data.csv"
+
 print("************************************************")
 print("--- Machine Learning Data Loader ---")
 file_prompt = input(f"Enter the CLEANED filename to load (default: {default_file}): ").strip()
@@ -15,79 +20,141 @@ if not target_file.lower().endswith('.csv'):
 
 input_path = os.path.join(data_dir, target_file)
 
+X_train, X_test, y_train, y_test = preprocess_and_split(input_path)
+
+
+
+
 print("************************************************")
 print(f"MODEL TRAINING")
 print("************************************************")
 
-def build_model(input_dim: int):
-    model = models.Sequential([
-        layers.Input(shape=(input_dim,)),
 
-        layers.Dense(64, activation='relu'),
-        layers.BatchNormalization(),
-        layers.Dropout(0.3),
 
-        layers.Dense(32, activation='relu'),
-        layers.Dropout(0.2),
+def build_model(input_dim, hidden_layers, activation, lr, dropout, optimizer_type):
+    model = models.Sequential()
+    model.add(layers.Input(shape=(input_dim,)))
 
-        layers.Dense(16, activation='relu'),
-        layers.Dropout(0.1),
+    for i, units in enumerate(hidden_layers):
+        model.add(layers.Dense(units, activation=activation))
+        model.add(layers.BatchNormalization())
+        
+        model.add(layers.Dropout(dropout * (0.7 ** i)))
 
-        layers.Dense(1, activation='sigmoid')
-    ])
+    model.add(layers.Dense(1, activation="sigmoid"))
+
+
+    if optimizer_type == "adam":
+        opt = Adam(learning_rate=lr)
+    elif optimizer_type == "rmsprop":
+        opt = RMSprop(learning_rate=lr)
+    elif optimizer_type == "nadam":
+        opt = Nadam(learning_rate=lr)
+    elif optimizer_type == "adamw":
+        opt = tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=1e-4)
+    else:
+        opt = Adam(learning_rate=lr)
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=[
-            'accuracy',
-            tf.keras.metrics.AUC(name="auc")
-        ]
+        optimizer=opt,
+        loss="binary_crossentropy",
+        metrics=[tf.keras.metrics.AUC(name="auc")]
     )
-
     return model
 
-X_train, X_test, y_train, y_test = preprocess_and_split(input_path)
 
-print("X_train shape:", X_train.shape)
-print("X_test shape:", X_test.shape)
+architectures = [[64, 32], [128, 64, 32], [256, 128, 64, 32]]
+activations = ["relu", "elu", "swish"]
+optimizers = ["adam", "rmsprop", "nadam", "adamw"]
+learning_rates = [0.001, 0.0005, 0.0001]
+batch_sizes = [16, 32, 64]
+dropouts = [0.2, 0.3, 0.4]
+seeds = [1, 2, 3]
+
+results = []
+
+print("\n************************************************")
+print(f"STARTING FULL EXPERIMENT GRID")
+print(f"Total Unique Configs: {len(architectures)*len(activations)*len(optimizers)*len(learning_rates)*len(batch_sizes)*len(dropouts)}")
+print("************************************************\n")
 
 
-early_stop = callbacks.EarlyStopping(
-    monitor="val_loss",
-    patience=10,
-    restore_best_weights=True
-)
-reduce_lr = callbacks.ReduceLROnPlateau(
-    monitor="val_loss",
-    factor=0.5,
-    patience=5,
-    min_lr=1e-5
-)
-model = build_model(X_train.shape[1])
+for lr in learning_rates:
+    for batch in batch_sizes:
+        for dropout in dropouts:
+            for arch in architectures:
+                for act in activations:
+                    for opt in optimizers:
+                        
+                        run_aucs = []
+                        
+                        for seed in seeds:
+                            tf.keras.backend.clear_session()
+                            tf.random.set_seed(seed)
+                            np.random.seed(seed)
 
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=50,
-    batch_size=32,
-    shuffle=False,
-    callbacks=[early_stop, reduce_lr],
-    verbose=1
-)
+                            model = build_model(
+                                input_dim=X_train.shape[1],
+                                hidden_layers=arch,
+                                activation=act,
+                                lr=lr,
+                                dropout=dropout,
+                                optimizer_type=opt
+                            )
 
-loss, acc, auc = model.evaluate(X_test, y_test, verbose=0)
+                            early_stop = callbacks.EarlyStopping(
+                                monitor="val_loss",
+                                patience=5,
+                                restore_best_weights=True
+                            )
 
-print("\n==========================")
-print("TEST RESULTS")
-print("==========================")
-print(f"Loss: {loss:.4f}")
-print(f"Accuracy: {acc:.4f}")
-print(f"AUC: {auc:.4f}")
+                            model.fit(
+                                X_train, y_train,
+                                validation_data=(X_test, y_test),
+                                epochs=30,
+                                batch_size=batch,
+                                verbose=0,
+                                shuffle=True,
+                                callbacks=[early_stop]
+                            )
 
-save_path = "models/stock_model.keras"
-os.makedirs("models", exist_ok=True)
+                            _, auc = model.evaluate(X_test, y_test, verbose=0)
+                            run_aucs.append(auc)
 
-model.save(save_path)
+                        mean_auc = np.mean(run_aucs)
+                        std_auc = np.std(run_aucs)
 
-print(f"\nModel saved to: {save_path}")
+                        results.append({
+                            "lr": lr,
+                            "batch": batch,
+                            "dropout": dropout,
+                            "arch": str(arch),
+                            "activation": act,
+                            "optimizer": opt,
+                            "auc_mean": mean_auc,
+                            "auc_std": std_auc
+                        })
+
+                        print(f"LR:{lr} | Batch:{batch} | Drop:{dropout} | Arch:{arch} | Act:{act} | Opt:{opt} | AUC:{mean_auc:.4f}")
+                        
+                        if len(results) % 5 == 0:
+                            pd.DataFrame(results).to_csv(output_path, index=False)
+
+results_df = pd.DataFrame(results)
+
+if not results_df.empty:
+    results_df = results_df.sort_values(by="auc_mean", ascending=False)
+    results_df.to_csv(output_path, index=False)
+    print("\nSaved final experiment results to:", output_path)
+    print("\n==========================")
+    print("TOP 10 RESULTS")
+    print("==========================")
+    print(results_df.head(10))
+
+    best = results_df.iloc[0]
+    print("\n==========================")
+    print("BEST CONFIGURATION")
+    print("==========================")
+    print(best)
+else:
+    print("No results to display.")
